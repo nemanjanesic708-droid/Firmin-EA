@@ -1,0 +1,50 @@
+// Replace 192.168.0.50 with your API server LAN IP if testing outside Docker
+### Health
+GET http://127.0.0.1:8000/health
+
+### Heartbeat
+POST http://127.0.0.1:8000/heartbeat
+Authorization: Bearer KEY1
+Content-Type: application/json
+
+{
+  "bot_id": "bot-1",
+  "spread": 12,
+  "equity": 1000,
+  "features": {"rsi": 48, "atr": 0.0007, "session": "LDN"}
+}
+
+### Decision
+GET http://127.0.0.1:8000/decisions/next?bot_id=bot-1
+Authorization: Bearer KEY1
+
+### Execution (opened)
+POST http://127.0.0.1:8000/executions
+Authorization: Bearer KEY1
+Content-Type: application/json
+
+{
+  "decision_id": "REPLACE_WITH_DECISION_UUID",
+  "bot_id": "bot-1",
+  "status": "OPENED",
+  "order_ticket": 1234567,
+  "entry_price": 1.12345
+}
+
+### Execution (closed)
+POST http://127.0.0.1:8000/executions
+Authorization: Bearer KEY1
+Content-Type: application/json
+
+{
+  "decision_id": "REPLACE_WITH_DECISION_UUID",
+  "bot_id": "bot-1",
+  "status": "CLOSED",
+  "exit_price": 1.12420,
+  "pnl": 7.5,
+  "mfe": 12.0,
+  "mae": -3.0
+}
+
+### Train model (after you have data)
+POST http://127.0.0.1:8000/admin/train?key=changeme-admin
