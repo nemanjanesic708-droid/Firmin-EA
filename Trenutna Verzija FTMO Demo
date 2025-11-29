@@ -1,0 +1,556 @@
+//+------------------------------------------------------------------+
+//|                     TrendPortfolio_v2_fix_sync.mq5                |
+//|  Portfolijski EA (trend pullback + donchian breakout).            |
+//|  Sadrži hot-fix za MT5 tester: EnsureSeriesReady() pre iMA/iATR   |
+//|  kako bi se izbegao error 4805 (cannot load indicator...).        |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "2.02"
+
+#include <Trade/Trade.mqh>
+
+//============================ INPUTS =================================
+
+// Simboli (zarezom)
+input string SymbolsList_input              = "EURUSD,GBPUSD,USDJPY";
+
+// Magic base
+input uint   MagicBase_input                = 270001;
+
+// TF-ovi
+input ENUM_TIMEFRAMES TrendTF_input         = PERIOD_H4;
+input ENUM_TIMEFRAMES EntryTF_input         = PERIOD_H1;
+
+// Trend EMA
+input int    TrendFastEMA_input             = 50;
+input int    TrendSlowEMA_input             = 200;
+
+// ----- MODUL A: PULLBACK -----
+input bool   UsePullback_input              = false;
+input int    PullbackEMA_input              = 20;
+
+// ----- MODUL B: DONCHIAN BREAKOUT -----
+input bool   UseDonchian_input              = true;
+input int    DonLen_input                   = 20;      // lookback za HH/LL (bez tekuće sveće)
+input double DonBufferPips_input            = 1.5;     // dodatni buffer (pips)
+input int    ADX_Period_input               = 14;
+input double ADX_Min_input                  = 18.0;    // minimalni ADX (0=off)
+
+// ATR/SL/TP
+input int    ATR_Period_input               = 14;
+input double RiskR_SL_mult_input            = 1.2;     // SL = ATR * SL_mult
+input double RiskR_TP_mult_input            = 2.4;     // TP = ATR * TP_mult
+
+// Min volatilnost
+input double MinAtrPips_input               = 6.0;
+
+// Risk
+input bool   UseRiskPercent_input           = true;
+input double RiskPercent_input              = 0.25;    // % balansa po trejdu
+input double FixedLot_input                 = 0.10;
+
+// Ograničenja
+input int    MaxPositionsPerSymbol_input    = 1;
+input int    MaxTotalPositions_input        = 6;
+
+// Spread filter (poeni)
+input double MaxSpreadPoints_input          = 25.0;
+
+// Jedan entry po bar-u
+input bool   OneEntryPerBar_input           = true;
+
+// Sesija (server vreme)
+input int    SessionStartHour_input         = 8;
+input int    SessionEndHour_input           = 22;
+
+// Zaštite
+input double MaxDailyLossPercent_input      = 2.0;
+input int    MaxConsecLosses_input          = 5;
+input double MaxEquityDDPercent_input       = 0.0;
+
+// Ostalo
+input bool   AllowLongs_input               = true;
+input bool   AllowShorts_input              = true;
+input bool   DebugMode_input                = true;
+
+//============================ INTERNAL ===============================
+
+CTrade trade;
+
+struct SymbolState
+{
+   string      name;
+   uint        magic;
+
+   // Trend
+   int         maFastHandle;
+   int         maSlowHandle;
+
+   // Modul A
+   int         maPullbackHandle;
+
+   // ATR (za oba)
+   int         atrHandle;
+
+   // Modul B
+   int         adxHandle;
+
+   datetime    lastBarTime;
+};
+
+#define MAX_SYMBOLS 16
+SymbolState g_syms[MAX_SYMBOLS];
+int         g_symCount = 0;
+
+// Globalne metrike
+int     g_todayDate        = -1;
+double  g_dailyStartEquity = 0.0;
+double  g_equityHigh       = 0.0;
+
+// Reentrancy
+bool    g_openingNow       = false;
+
+//============================ HELPERS ================================
+
+void Log(string msg){ if(DebugMode_input) Print("[TPv2] ", msg); }
+
+double PipSize(const string sym)
+{
+   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double pt  = SymbolInfoDouble(sym, SYMBOL_POINT);
+   return (digits==3 || digits==5) ? pt*10.0 : pt;
+}
+
+double PipValuePerLot(const string sym)
+{
+   double tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   if(ts<=0.0) return 0.0;
+   return tv * (PipSize(sym)/ts);
+}
+
+double NormalizeLot(const string sym, double lot)
+{
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(lot<minLot) lot=minLot;
+   if(lot>maxLot) lot=maxLot;
+   if(step>0.0) lot=MathFloor(lot/step)*step;
+   return NormalizeDouble(lot,2);
+}
+
+bool InSession()
+{
+   if(SessionStartHour_input==SessionEndHour_input) return true;
+   MqlDateTime t; TimeToStruct(TimeCurrent(), t);
+   if(SessionStartHour_input < SessionEndHour_input)
+      return (t.hour>=SessionStartHour_input && t.hour<SessionEndHour_input);
+   return (t.hour>=SessionStartHour_input || t.hour<SessionEndHour_input);
+}
+
+bool CheckSpreadOK(const string sym)
+{
+   MqlTick tick; if(!SymbolInfoTick(sym,tick)) return false;
+   double pt = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double sp = (tick.ask - tick.bid)/pt;
+   if(MaxSpreadPoints_input>0 && sp>MaxSpreadPoints_input){ Log(sym+" spread="+DoubleToString(sp,1)); return false; }
+   return true;
+}
+
+void DailyResetIfNeeded()
+{
+   MqlDateTime t; TimeToStruct(TimeCurrent(), t);
+   if(g_todayDate!=t.day)
+   {
+      g_todayDate=t.day;
+      g_dailyStartEquity=AccountInfoDouble(ACCOUNT_EQUITY);
+      if(g_dailyStartEquity<=0) g_dailyStartEquity=AccountInfoDouble(ACCOUNT_BALANCE);
+      Log("New day. Start equity="+DoubleToString(g_dailyStartEquity,2));
+   }
+}
+
+bool GateDailyLoss()
+{
+   if(MaxDailyLossPercent_input<=0 || g_dailyStartEquity<=0) return true;
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq<=0) return false;
+   double ddp=(eq-g_dailyStartEquity)/g_dailyStartEquity*100.0;
+   if(ddp<=-MaxDailyLossPercent_input){ Log("Daily loss hit "+DoubleToString(ddp,2)+"%"); return false; }
+   return true;
+}
+
+bool GateEquityDD()
+{
+   if(MaxEquityDDPercent_input<=0) return true;
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq<=0) return false;
+   if(g_equityHigh<=0 || eq>g_equityHigh) g_equityHigh=eq;
+   double ddp=(eq-g_equityHigh)/g_equityHigh*100.0;
+   if(ddp<=-MaxEquityDDPercent_input){ Log("Global DD hit "+DoubleToString(ddp,2)+"%"); return false; }
+   return true;
+}
+
+int CountPositionsForSymbol(const string sym, uint magic)
+{
+   int total=PositionsTotal(), cnt=0;
+   for(int i=0;i<total;i++){
+      ulong tk=PositionGetTicket(i); if(!PositionSelectByTicket(tk)) continue;
+      if((string)PositionGetString(POSITION_SYMBOL)==sym
+      && (uint)PositionGetInteger(POSITION_MAGIC)==magic) cnt++;
+   }
+   return cnt;
+}
+
+int CountAllMyPositions()
+{
+   int total=PositionsTotal(), cnt=0;
+   for(int i=0;i<total;i++){
+      ulong tk=PositionGetTicket(i); if(!PositionSelectByTicket(tk)) continue;
+      uint mm=(uint)PositionGetInteger(POSITION_MAGIC);
+      if(mm>=MagicBase_input && mm<MagicBase_input+2000) cnt++;
+   }
+   return cnt;
+}
+
+int GetConsecLossesForSymbol(const string sym, uint magic)
+{
+   if(MaxConsecLosses_input<=0) return 0;
+   MqlDateTime t; TimeToStruct(TimeCurrent(), t); t.hour=0; t.min=0; t.sec=0;
+   datetime dayStart=StructToTime(t);
+   if(!HistorySelect(dayStart, TimeCurrent())) return 0;
+   int deals=HistoryDealsTotal(), losses=0;
+   for(int i=deals-1;i>=0;i--)
+   {
+      ulong d=HistoryDealGetTicket(i); if(d==0) continue;
+      if((string)HistoryDealGetString(d,DEAL_SYMBOL)!=sym) continue;
+      if((uint)HistoryDealGetInteger(d,DEAL_MAGIC)!=magic) continue;
+      int type=(int)HistoryDealGetInteger(d,DEAL_TYPE);
+      if(type!=DEAL_TYPE_BUY && type!=DEAL_TYPE_SELL) continue;
+      double p=HistoryDealGetDouble(d,DEAL_PROFIT)
+              +HistoryDealGetDouble(d,DEAL_SWAP)
+              +HistoryDealGetDouble(d,DEAL_COMMISSION);
+      if(p<0) losses++;
+      else if(p>0) break;
+   }
+   return losses;
+}
+
+bool BeginOpen(){ if(g_openingNow) return false; g_openingNow=true; return true; }
+void EndOpen(){ g_openingNow=false; }
+
+double AccountBalanceSafe()
+{
+   double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   return (eq>0 && eq<bal)? eq : bal;
+}
+
+double CalcLotByRisk(const string sym, double slPrice, double entryPrice, ENUM_ORDER_TYPE type)
+{
+   if(!UseRiskPercent_input || RiskPercent_input<=0) return NormalizeLot(sym, FixedLot_input);
+   double riskMoney=AccountBalanceSafe()*(RiskPercent_input/100.0);
+   if(riskMoney<=0) return NormalizeLot(sym, FixedLot_input);
+   double dist=(type==ORDER_TYPE_BUY)? (entryPrice-slPrice):(slPrice-entryPrice);
+   if(dist<=0) return NormalizeLot(sym, FixedLot_input);
+   double pips=dist/PipSize(sym), pipVal=PipValuePerLot(sym);
+   if(pips<=0 || pipVal<=0) return NormalizeLot(sym, FixedLot_input);
+   return NormalizeLot(sym, riskMoney/(pips*pipVal));
+}
+
+//======================== TREND & SIGNALI ===========================
+
+int GetTrendDirection(SymbolState &s)
+{
+   double f[1], w[1];
+   if(CopyBuffer(s.maFastHandle,0,1,1,f)!=1) return 0;
+   if(CopyBuffer(s.maSlowHandle,0,1,1,w)!=1) return 0;
+   if(f[0]>w[0]) return 1;
+   if(f[0]<w[0]) return -1;
+   return 0;
+}
+
+// Modul A: Pullback
+bool GetPullbackSignal(SymbolState &s, int &dir, double &entryPrice, double &sl, double &tp)
+{
+   dir=0; entryPrice=0.0; sl=0.0; tp=0.0;
+   int trendDir=GetTrendDirection(s);
+   if(trendDir==0) return false;
+
+   MqlRates r[3];
+   if(CopyRates(s.name, EntryTF_input, 0, 3, r)<3) return false;
+
+   double ema[3];
+   if(CopyBuffer(s.maPullbackHandle,0,0,3,ema)<3) return false;
+
+   double atrArr[1];
+   if(CopyBuffer(s.atrHandle,0,1,1,atrArr)!=1) return false;
+   double atr=atrArr[0];
+   if(atr<=0) return false;
+
+   if(MinAtrPips_input>0){
+      double atrPips=atr/PipSize(s.name);
+      if(atrPips<MinAtrPips_input) return false;
+   }
+
+   double prevClose=r[1].close, prevLow=r[1].low, prevHigh=r[1].high, pb=ema[1];
+   int digits=(int)SymbolInfoInteger(s.name, SYMBOL_DIGITS);
+
+   if(trendDir>0 && AllowLongs_input){
+      if(prevLow<=pb && prevClose>pb){
+         dir=1; entryPrice=prevClose;
+         sl=NormalizeDouble(entryPrice - RiskR_SL_mult_input*atr, digits);
+         tp=NormalizeDouble(entryPrice + RiskR_TP_mult_input*atr, digits);
+         return true;
+      }
+   }
+   if(trendDir<0 && AllowShorts_input){
+      if(prevHigh>=pb && prevClose<pb){
+         dir=-1; entryPrice=prevClose;
+         sl=NormalizeDouble(entryPrice + RiskR_SL_mult_input*atr, digits);
+         tp=NormalizeDouble(entryPrice - RiskR_TP_mult_input*atr, digits);
+         return true;
+      }
+   }
+   return false;
+}
+
+// Modul B: Donchian breakout + ADX filter
+bool GetDonchianBreakoutSignal(SymbolState &s, int &dir, double &entryPrice, double &sl, double &tp)
+{
+   dir=0; entryPrice=0.0; sl=0.0; tp=0.0;
+
+   int trendDir=GetTrendDirection(s);
+   if(trendDir==0) return false;
+
+   // Donchian iz poslednjih DonLen barova (bez tekuće)
+   int len = (DonLen_input<=2 ? 2 : DonLen_input);
+   double highs[], lows[];
+   ArrayResize(highs,len);
+   ArrayResize(lows,len);
+
+   int gotH = CopyHigh(s.name, EntryTF_input, 1, len, highs);
+   int gotL = CopyLow (s.name, EntryTF_input, 1, len, lows);
+   if(gotH< len || gotL< len) return false;
+
+   double donHigh=highs[0], donLow=lows[0];
+   for(int i=1;i<len;i++){ if(highs[i]>donHigh) donHigh=highs[i]; if(lows[i]<donLow) donLow=lows[i]; }
+
+   // ADX
+   if(ADX_Min_input>0){
+      double adxArr[1];
+      if(CopyBuffer(s.adxHandle,0,1,1,adxArr)!=1) return false;
+      if(adxArr[0] < ADX_Min_input) return false;
+   }
+
+   // ATR
+   double atrArr[1];
+   if(CopyBuffer(s.atrHandle,0,1,1,atrArr)!=1) return false;
+   double atr=atrArr[0]; if(atr<=0) return false;
+
+   if(MinAtrPips_input>0){
+      double atrPips=atr/PipSize(s.name);
+      if(atrPips<MinAtrPips_input) return false;
+   }
+
+   // prethodna zatvorena sveća
+   MqlRates r[2];
+   if(CopyRates(s.name, EntryTF_input, 0, 2, r)<2) return false;
+   double prevClose=r[1].close;
+
+   // buffer u CENI (ne u poenima): pips -> price
+   double bufferPrice = DonBufferPips_input * PipSize(s.name);
+   int digits=(int)SymbolInfoInteger(s.name, SYMBOL_DIGITS);
+
+   if(trendDir>0 && AllowLongs_input){
+      if(prevClose > donHigh + bufferPrice){
+         dir=1; entryPrice=prevClose;
+         sl=NormalizeDouble(entryPrice - RiskR_SL_mult_input*atr, digits);
+         tp=NormalizeDouble(entryPrice + RiskR_TP_mult_input*atr, digits);
+         return true;
+      }
+   }
+   if(trendDir<0 && AllowShorts_input){
+      if(prevClose < donLow - bufferPrice){
+         dir=-1; entryPrice=prevClose;
+         sl=NormalizeDouble(entryPrice + RiskR_SL_mult_input*atr, digits);
+         tp=NormalizeDouble(entryPrice - RiskR_TP_mult_input*atr, digits);
+         return true;
+      }
+   }
+   return false;
+}
+
+//============================ TRADE EXEC =============================
+
+bool OpenTrade(SymbolState &s, int dir, double entryPrice, double sl, double tp)
+{
+   if(dir!=1 && dir!=-1) return false;
+   if(!BeginOpen()) return false;
+
+   MqlTick tick; if(!SymbolInfoTick(s.name, tick)){ EndOpen(); return false; }
+   ENUM_ORDER_TYPE type = (dir>0? ORDER_TYPE_BUY: ORDER_TYPE_SELL);
+   double price = (dir>0? tick.ask: tick.bid);
+
+   double lot = CalcLotByRisk(s.name, sl, price, type);
+   if(lot<=0){ EndOpen(); return false; }
+
+   trade.SetExpertMagicNumber(s.magic);
+   trade.SetTypeFillingBySymbol(s.name);
+
+   bool ok = (dir>0)? trade.Buy(lot, s.name, 0.0, sl, tp)
+                    : trade.Sell(lot, s.name, 0.0, sl, tp);
+
+   if(ok) Log(StringFormat("%s %s lot=%.2f SL=%.5f TP=%.5f",
+           s.name,(dir>0?"BUY":"SELL"),lot,sl,tp));
+   else   Log(StringFormat("%s order failed err=%d", s.name, _LastError));
+
+   EndOpen();
+   return ok;
+}
+
+//===================== SERIES SYNC HOT-FIX ===========================
+
+bool EnsureSeriesReady(const string sym, ENUM_TIMEFRAMES tf, int min_bars=5, int wait_ms=4000)
+{
+   MqlRates tmp[];
+   int start = (int)GetTickCount();
+   ResetLastError();
+   CopyRates(sym, tf, 0, min_bars, tmp);
+   while(!SeriesInfoInteger(sym, tf, SERIES_SYNCHRONIZED))
+   {
+      if((int)GetTickCount() - start > wait_ms) break;
+      Sleep(50);
+      ResetLastError();
+      CopyRates(sym, tf, 0, min_bars, tmp);
+   }
+   return SeriesInfoInteger(sym, tf, SERIES_SYNCHRONIZED);
+}
+
+//=========================== INIT/DEINIT ============================
+
+int OnInit()
+{
+   string parts[]; int cnt=StringSplit(SymbolsList_input, ',', parts);
+   g_symCount=0;
+
+   for(int i=0;i<cnt && g_symCount<MAX_SYMBOLS;i++)
+   {
+      string sym=parts[i]; StringTrimLeft(sym); StringTrimRight(sym);
+      if(sym=="") continue;
+      if(!SymbolSelect(sym,true)){ Log("Skip unknown "+sym); continue; }
+
+      // >>> NOVO: nateraj tester da učita H4/H1 (ili koje si setovao)
+      if(!EnsureSeriesReady(sym, TrendTF_input) || !EnsureSeriesReady(sym, EntryTF_input))
+      {
+         Log("Series not ready for "+sym+" (trend/entry TF)"); 
+         continue; // preskoči simbol umesto INIT_FAILED
+      }
+
+      int idx=g_symCount;
+      g_syms[idx].name  = sym;
+      g_syms[idx].magic = MagicBase_input + idx;
+
+      ResetLastError();
+      g_syms[idx].maFastHandle     = iMA(sym, TrendTF_input, TrendFastEMA_input, 0, MODE_EMA, PRICE_CLOSE);
+      g_syms[idx].maSlowHandle     = iMA(sym, TrendTF_input, TrendSlowEMA_input, 0, MODE_EMA, PRICE_CLOSE);
+      g_syms[idx].maPullbackHandle = iMA(sym, EntryTF_input, PullbackEMA_input, 0, MODE_EMA, PRICE_CLOSE);
+      g_syms[idx].atrHandle        = iATR(sym, EntryTF_input, ATR_Period_input);
+      g_syms[idx].adxHandle        = iADX(sym, EntryTF_input, ADX_Period_input);
+
+      if(g_syms[idx].maFastHandle==INVALID_HANDLE ||
+         g_syms[idx].maSlowHandle==INVALID_HANDLE ||
+         g_syms[idx].atrHandle==INVALID_HANDLE ||
+         (UsePullback_input && g_syms[idx].maPullbackHandle==INVALID_HANDLE) ||
+         (UseDonchian_input && ADX_Min_input>0 && g_syms[idx].adxHandle==INVALID_HANDLE))
+      {
+         int e=_LastError;
+         Log(StringFormat("Indicator init failed for %s, err=%d", sym, e));
+         continue;
+      }
+
+      g_syms[idx].lastBarTime=0;
+      Log("Loaded "+sym+" magic="+IntegerToString((int)g_syms[idx].magic));
+      g_symCount++;
+   }
+
+   if(g_symCount==0){ Log("No valid symbols after sync; check symbol names & history."); return INIT_SUCCEEDED; }
+
+   g_equityHigh=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(g_equityHigh<=0) g_equityHigh=AccountInfoDouble(ACCOUNT_BALANCE);
+   DailyResetIfNeeded();
+
+   Log("INIT ok, symbols="+IntegerToString(g_symCount));
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int)
+{
+   for(int i=0;i<g_symCount;i++){
+      if(g_syms[i].maFastHandle     !=INVALID_HANDLE) IndicatorRelease(g_syms[i].maFastHandle);
+      if(g_syms[i].maSlowHandle     !=INVALID_HANDLE) IndicatorRelease(g_syms[i].maSlowHandle);
+      if(g_syms[i].maPullbackHandle !=INVALID_HANDLE) IndicatorRelease(g_syms[i].maPullbackHandle);
+      if(g_syms[i].atrHandle        !=INVALID_HANDLE) IndicatorRelease(g_syms[i].atrHandle);
+      if(g_syms[i].adxHandle        !=INVALID_HANDLE) IndicatorRelease(g_syms[i].adxHandle);
+   }
+}
+
+//============================= TICK =================================
+
+void OnTick()
+{
+   if(g_symCount<=0) return;
+
+   DailyResetIfNeeded();
+   if(!InSession())    return;
+   if(!GateEquityDD()) return;
+   if(!GateDailyLoss()) return;
+
+   int allPos=CountAllMyPositions();
+   if(MaxTotalPositions_input>0 && allPos>=MaxTotalPositions_input) return;
+
+   for(int i=0;i<g_symCount;i++)
+   {
+      string sym=g_syms[i].name; uint magic=g_syms[i].magic;
+
+      if(!CheckSpreadOK(sym)) continue;
+
+      if(MaxConsecLosses_input>0){
+         int cl=GetConsecLossesForSymbol(sym,magic);
+         if(cl>=MaxConsecLosses_input){ Log(sym+" blocked consec="+IntegerToString(cl)); continue; }
+      }
+
+      if(MaxPositionsPerSymbol_input>0 && CountPositionsForSymbol(sym,magic)>=MaxPositionsPerSymbol_input)
+         continue;
+
+      allPos=CountAllMyPositions();
+      if(MaxTotalPositions_input>0 && allPos>=MaxTotalPositions_input) break;
+
+      if(OneEntryPerBar_input){
+         datetime bt=iTime(sym, EntryTF_input, 0);
+         if(bt==g_syms[i].lastBarTime) continue;
+      }
+
+      // --- tražimo signal (inicijalizovano da nema warninga)
+      int    dir = 0;
+      double ep  = 0.0;
+      double sl  = 0.0;
+      double tp  = 0.0;
+      bool   got = false;
+
+      // Redosled: breakout pa pullback (možeš da obrneš)
+      if(UseDonchian_input && !got)
+         got = GetDonchianBreakoutSignal(g_syms[i], dir, ep, sl, tp);
+
+      if(UsePullback_input && !got)
+         got = GetPullbackSignal(g_syms[i], dir, ep, sl, tp);
+
+      if(!got) continue;
+
+      if(OneEntryPerBar_input)
+         g_syms[i].lastBarTime = iTime(sym, EntryTF_input, 0);
+
+      OpenTrade(g_syms[i], dir, ep, sl, tp);
+   }
+}
+//+------------------------------------------------------------------+
